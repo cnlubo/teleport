@@ -1,5 +1,5 @@
 /*
-Copyright 2015 Gravitational, Inc.
+Copyright 2015-2019 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -56,6 +56,8 @@ type AgentPool struct {
 	discoveryC chan *discoveryRequest
 	// lastReport is the last time the agent has reported the stats
 	lastReport time.Time
+
+	lastDiscoveryRequest map[agentKey]*discoveryRequest
 }
 
 // AgentPoolConfig holds configuration parameters for the agent pool
@@ -121,11 +123,12 @@ func NewAgentPool(cfg AgentPoolConfig) (*AgentPool, error) {
 	}
 	ctx, cancel := context.WithCancel(cfg.Context)
 	pool := &AgentPool{
-		agents:     make(map[agentKey][]*Agent),
-		cfg:        cfg,
-		ctx:        ctx,
-		cancel:     cancel,
-		discoveryC: make(chan *discoveryRequest),
+		agents:               make(map[agentKey][]*Agent),
+		cfg:                  cfg,
+		ctx:                  ctx,
+		cancel:               cancel,
+		discoveryC:           make(chan *discoveryRequest),
+		lastDiscoveryRequest: make(map[agentKey]*discoveryRequest),
 	}
 	pool.Entry = log.WithFields(log.Fields{
 		trace.Component: teleport.ComponentReverseTunnelAgent,
@@ -158,6 +161,9 @@ func (m *AgentPool) Wait() error {
 }
 
 func (m *AgentPool) processDiscoveryRequests() {
+	ticker := time.NewTicker(defaults.ReverseTunnelAgentHeartbeatPeriod)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-m.ctx.Done():
@@ -165,10 +171,18 @@ func (m *AgentPool) processDiscoveryRequests() {
 			return
 		case req := <-m.discoveryC:
 			if req == nil {
-				m.Debugf("channel closed")
+				m.Debugf("Channel closed.")
 				return
 			}
+
+			// Save last discoveryRequest so it can be periodically re-tried.
+			m.lastDiscoveryRequest[req.key()] = req
+
 			m.tryDiscover(*req)
+		case <-ticker.C:
+			for _, req := range m.lastDiscoveryRequest {
+				m.tryDiscover(*req)
+			}
 		}
 	}
 }
@@ -307,10 +321,10 @@ func (m *AgentPool) pollAndSyncAgents() {
 
 func (m *AgentPool) addAgent(key agentKey, discoverProxies []services.Server) error {
 	// If the component connecting is a proxy, get the cluster name from the
-	// tunnelID (where it is the name of the remote cluster). If it's a node, get
+	// clusterName (where it is the name of the remote cluster). If it's a node, get
 	// the cluster name from the agent pool configuration itself (where it is
 	// the name of the local cluster).
-	clusterName := key.tunnelID
+	clusterName := key.clusterName
 	if key.tunnelType == string(services.NodeTunnel) {
 		clusterName = m.cfg.Cluster
 	}
@@ -350,7 +364,7 @@ func (m *AgentPool) Counts() map[string]int {
 	out := make(map[string]int)
 
 	for key, agents := range m.agents {
-		out[key.tunnelID] += len(agents)
+		out[key.clusterName] += len(agents)
 	}
 
 	return out
@@ -369,7 +383,7 @@ func (m *AgentPool) getReverseTunnels() ([]services.ReverseTunnel, error) {
 		return m.cfg.AccessPoint.GetReverseTunnels()
 	case teleport.ComponentNode:
 		reverseTunnel := services.NewReverseTunnel(
-			m.cfg.HostUUID,
+			m.cfg.Cluster,
 			[]string{m.cfg.ProxyAddr},
 		)
 		reverseTunnel.SetType(services.NodeTunnel)
@@ -389,7 +403,7 @@ func (m *AgentPool) reportStats() {
 	}
 
 	for key, agents := range m.agents {
-		m.Debugf("Outbound tunnel for %v connected to %v proxies.", key.tunnelID, len(agents))
+		m.Debugf("Outbound tunnel for %v connected to %v proxies.", key.clusterName, len(agents))
 
 		countPerState := map[string]int{
 			agentStateConnecting:   0,
@@ -402,7 +416,7 @@ func (m *AgentPool) reportStats() {
 			countPerState[a.getState()]++
 		}
 		for state, count := range countPerState {
-			gauge, err := trustedClustersStats.GetMetricWithLabelValues(key.tunnelID, state)
+			gauge, err := trustedClustersStats.GetMetricWithLabelValues(key.clusterName, state)
 			if err != nil {
 				m.Warningf("Failed to get gauge: %v.", err)
 				continue
@@ -410,7 +424,7 @@ func (m *AgentPool) reportStats() {
 			gauge.Set(float64(count))
 		}
 		if logReport {
-			m.WithFields(log.Fields{"target": key.tunnelID, "stats": countPerState}).Info("Outbound tunnel stats.")
+			m.WithFields(log.Fields{"target": key.clusterName, "stats": countPerState}).Info("Outbound tunnel stats.")
 		}
 	}
 }
@@ -488,7 +502,7 @@ func tunnelToAgentKeys(tunnel services.ReverseTunnel) ([]agentKey, error) {
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-		out[i] = agentKey{addr: *netaddr, tunnelType: string(tunnel.GetType()), tunnelID: tunnel.GetClusterName()}
+		out[i] = agentKey{addr: *netaddr, tunnelType: string(tunnel.GetType()), clusterName: tunnel.GetClusterName()}
 	}
 	return out, nil
 }
@@ -512,10 +526,8 @@ func diffTunnels(existingTunnels map[agentKey][]*Agent, arrivedKeys map[agentKey
 
 // agentKey is used to uniquely identify agents.
 type agentKey struct {
-	// tunnelID identifies who the tunnel is connected to. For trusted clusters,
-	// the tunnelID is the name of the remote cluster (like example.com). For
-	// nodes, it is the nodeID (like 4a050852-23b5-4d6d-a45f-bed02792d453.example.com).
-	tunnelID string
+	// clusterName is a cluster name of this agent
+	clusterName string
 
 	// tunnelType is the type of tunnel, is either node or proxy.
 	tunnelType string
@@ -526,5 +538,5 @@ type agentKey struct {
 }
 
 func (a *agentKey) String() string {
-	return fmt.Sprintf("agentKey(tunnelID=%v, type=%v, addr=%v)", a.tunnelID, a.tunnelType, a.addr.String())
+	return fmt.Sprintf("agentKey(cluster=%v, type=%v, addr=%v)", a.clusterName, a.tunnelType, a.addr.String())
 }
